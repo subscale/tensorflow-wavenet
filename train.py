@@ -35,7 +35,10 @@ EPSILON = 0.001
 ADAM_OPTIMIZER = 'adam'
 SGD_OPTIMIZER = 'sgd'
 SGD_MOMENTUM = 0.9
-
+PS_HOSTS = ''
+WORKER_HOSTS = ''
+STANDALONE = 'standalone' 
+JOB_NAME = STANDALONE
 
 def get_arguments():
     parser = argparse.ArgumentParser(description='WaveNet example network')
@@ -93,6 +96,14 @@ def get_arguments():
                         help='number of gpus to use')
     parser.add_argument('--random_crop', type=bool, default=False,
                         help='Whether to crop randomly')
+    parser.add_argument('--ps_hosts', type=str, default=PS_HOSTS,
+                        help='Comma-separated list of hostname:port pairs')
+    parser.add_argument('--worker_hosts', type=str, default=WORKER_HOSTS,
+                        help='Comma-separated list of hostname:port pairs')
+    parser.add_argument('--job_name', type=str, default=JOB_NAME,
+                        help="One of 'ps', 'worker', 'standalone'")
+    parser.add_argument('--task_index', type=int, default=0,
+                        help="Index of task within the job")
     return parser.parse_args()
 
 
@@ -174,75 +185,45 @@ def validate_directories(args):
         'restore_from': restore_from
     }
 
+def get_opt(args):
+    if args.optimizer == ADAM_OPTIMIZER:
+        optimizer = tf.train.AdamOptimizer(learning_rate=args.learning_rate)
+    elif args.optimizer == SGD_OPTIMIZER:
+        optimizer = tf.train.MomentumOptimizer(learning_rate=args.learning_rate,
+                                            momentum=args.sgd_momentum)
+    else:
+        # This shouldn't happen, given the choices specified in argument
+        # specification.
+        raise RuntimeError('Invalid optimizer option.')
+    return optimizer
 
-def main():
-    args = get_arguments()
+def build_tower(args,wavenet_params,audio_batch):
+    # Create network.
+    net = WaveNetModel(
+        batch_size=args.batch_size,
+        dilations=wavenet_params["dilations"],
+        filter_width=wavenet_params["filter_width"],
+        residual_channels=wavenet_params["residual_channels"],
+        dilation_channels=wavenet_params["dilation_channels"],
+        skip_channels=wavenet_params["skip_channels"],
+        quantization_channels=wavenet_params["quantization_channels"],
+        use_biases=wavenet_params["use_biases"],
+        scalar_input=wavenet_params["scalar_input"],
+        initial_filter_width=wavenet_params["initial_filter_width"])
+    if args.l2_regularization_strength == 0:
+        args.l2_regularization_strength = None
+    loss = net.loss(audio_batch, args.l2_regularization_strength)
 
-    try:
-        directories = validate_directories(args)
-    except ValueError as e:
-        print("Some arguments are wrong:")
-        print(str(e))
-        return
+    return loss
 
-    logdir = directories['logdir']
-    logdir_root = directories['logdir_root']
-    restore_from = directories['restore_from']
-
-    # Even if we restored the model, we will treat it as new training
-    # if the trained model is written into an arbitrary location.
-    is_overwritten_training = logdir != restore_from
-
-    with open(args.wavenet_params, 'r') as f:
-        wavenet_params = json.load(f)
-
-    # Create coordinator.
-    coord = tf.train.Coordinator()
-
-    # Load raw waveform from VCTK corpus.
-    with tf.name_scope('create_inputs'):
-        # Allow silence trimming to be skipped by specifying a threshold near
-        # zero.
-        silence_threshold = args.silence_threshold if args.silence_threshold > \
-                                                      EPSILON else None
-        reader = AudioReader(
-            args.data_dir,
-            coord,
-            sample_rate=wavenet_params['sample_rate'],
-            sample_size=args.sample_size,
-            random_crop=args.random_crop,
-            silence_threshold=args.silence_threshold)
-        audio_batch = reader.dequeue(args.batch_size)
-
+def build_multigpu(args,wavenet_params,audio_batch):
     tower_grads = []
     tower_losses = []
+    optimizer = get_opt(args)
     for device_index in xrange(args.num_gpus):
         with tf.device('/gpu:%d' % device_index):
             with tf.name_scope('tower_%d' % device_index) as scope:
-                # Create network.
-                net = WaveNetModel(
-                    batch_size=args.batch_size,
-                    dilations=wavenet_params["dilations"],
-                    filter_width=wavenet_params["filter_width"],
-                    residual_channels=wavenet_params["residual_channels"],
-                    dilation_channels=wavenet_params["dilation_channels"],
-                    skip_channels=wavenet_params["skip_channels"],
-                    quantization_channels=wavenet_params["quantization_channels"],
-                    use_biases=wavenet_params["use_biases"],
-                    scalar_input=wavenet_params["scalar_input"],
-                    initial_filter_width=wavenet_params["initial_filter_width"])
-                if args.l2_regularization_strength == 0:
-                    args.l2_regularization_strength = None
-                loss = net.loss(audio_batch, args.l2_regularization_strength)
-                if args.optimizer == ADAM_OPTIMIZER:
-                    optimizer = tf.train.AdamOptimizer(learning_rate=args.learning_rate)
-                elif args.optimizer == SGD_OPTIMIZER:
-                    optimizer = tf.train.MomentumOptimizer(learning_rate=args.learning_rate,
-                                                        momentum=args.sgd_momentum)
-                else:
-                    # This shouldn't happen, given the choices specified in argument
-                    # specification.
-                    raise RuntimeError('Invalid optimizer option.')
+                loss = build_tower(args,wavenet_params,audio_batch)
                 trainable = tf.trainable_variables()
                 grads = optimizer.compute_gradients(loss, var_list=trainable)
                 tower_losses.append(loss)
@@ -270,13 +251,176 @@ def main():
         grad_and_var = (grad,v)
         average_grads.append(grad_and_var)
     optim = optimizer.apply_gradients(average_grads)
+    summary_op = tf.merge_summary(summaries)
+    return loss, optim, summary_op
+
+def build_singlegpu(args,wavenet_params,audio_batch):
+    loss = build_tower(args,wavenet_params,audio_batch)
+    optimizer = get_opt(args)
+    trainable = tf.trainable_variables()
+    optim = optimizer.minimize(loss, var_list=trainable)
+    summary_op = tf.merge_all_summaries()
+    return loss, optim, summary_op
+
+def create_inputs(args,wavenet_params):
+    # Create coordinator.
+    coord = tf.train.Coordinator()
+
+    # Load raw waveform from VCTK corpus.
+    with tf.name_scope('create_inputs'):
+        # Allow silence trimming to be skipped by specifying a threshold near
+        # zero.
+        silence_threshold = args.silence_threshold if args.silence_threshold > \
+                                                      EPSILON else None
+        reader = AudioReader(
+            args.data_dir,
+            coord,
+            sample_rate=wavenet_params['sample_rate'],
+            sample_size=args.sample_size,
+            random_crop=args.random_crop,
+            silence_threshold=args.silence_threshold)
+        audio_batch = reader.dequeue(args.batch_size)
+
+    return coord, audio_batch, reader
+
+def main():
+    args = get_arguments()
+
+    try:
+        directories = validate_directories(args)
+    except ValueError as e:
+        print("Some arguments are wrong:")
+        print(str(e))
+        return
+
+    logdir = directories['logdir']
+    logdir_root = directories['logdir_root']
+    restore_from = directories['restore_from']
+
+    # Even if we restored the model, we will treat it as new training
+    # if the trained model is written into an arbitrary location.
+    is_overwritten_training = logdir != restore_from
+
+    with open(args.wavenet_params, 'r') as f:
+        wavenet_params = json.load(f)
+
+    if args.job_name != STANDALONE:
+        distributed(args,wavenet_params,logdir)
+    else:
+        standalone(args,wavenet_params,logdir,logdir_root,restore_from,is_overwritten_training)
+
+
+def distributed(args,wavenet_params,logdir):
+    ps_hosts = args.ps_hosts.split(",")
+    worker_hosts = args.worker_hosts.split(",")
+    cluster = tf.train.ClusterSpec({"ps": ps_hosts, "worker": worker_hosts})
+    server = tf.train.Server(cluster,
+        job_name=args.job_name,
+        task_index=args.task_index)
+
+    if args.job_name == "ps":
+        server.join()
+    elif args.job_name == "worker":
+        coord, audio_batch, reader = create_inputs(args,wavenet_params)
+
+        with tf.device(tf.train.replica_device_setter(
+            worker_device="/job:worker/task:%d" % args.task_index,
+            cluster=cluster)):
+            # Build graph
+            loss = build_tower(args,wavenet_params,audio_batch)
+            optimizer = get_opt(args)
+            global_step = tf.Variable(0)
+            num_workers = len(worker_hosts)
+
+            # Setup sync replicas optimizer
+            sync_rep_opt = tf.train.SyncReplicasOptimizer(optimizer, replicas_to_aggregate=num_workers,
+                replica_id=args.task_index, total_num_replicas=num_workers)
+
+            # Setup operators
+            train_op = sync_rep_opt.minimize(loss, global_step=global_step)
+            init_token_op = sync_rep_opt.get_init_tokens_op()
+
+            # Queue runner
+            chief_queue_runner = sync_rep_opt.get_chief_queue_runner()
+
+            # Summary op
+            summary_op = tf.merge_all_summaries()
+
+            # Init op
+            init_op = tf.initialize_all_variables()
+
+            # saver
+            saver = tf.train.Saver()
+
+        is_chief = (args.task_index == 0)
+
+        sv = tf.train.Supervisor(
+            is_chief=is_chief,
+            init_op=init_op,
+            summary_op=summary_op,
+            saver=saver,
+            global_step=global_step,
+            logdir=logdir
+        )
+
+        with sv.managed_session(server.target) as sess:
+            try:
+                threads = tf.train.start_queue_runners(sess=sess, coord=coord)
+                reader.start_threads(sess)
+
+                if is_chief:
+                    sv.start_queue_runners(sess, [chief_queue_runner])
+                    sess.run(init_token_op)
+
+                    # Set up logging for TensorBoard.
+                    writer = tf.train.SummaryWriter(logdir)
+                    writer.add_graph(tf.get_default_graph())
+
+                total_duration = 0
+                step = 0
+
+                while not sv.should_stop() and step <= args.num_steps:
+                    start_time = time.time()
+
+                    sys.stdout.flush()
+                    summary, loss_value, step, _ = sess.run([summary_op, loss, global_step, train_op])
+
+                    if is_chief:
+                        writer.add_summary(summary, step)
+
+                    duration = time.time() - start_time
+                    print('step {:d} - loss = {:.3f}, ({:.3f} sec/step)'
+                        .format(step, loss_value, duration))
+
+            except KeyboardInterrupt:
+                # Introduce a line break after ^C is displayed so save message
+                # is on its own line.
+                print()
+            finally:
+                save(saver, sess, logdir, step)
+
+                coord.request_stop()
+                coord.join(threads)
+
+                sv.stop()
+
+def get_tower(args,wavenet_params,audio_batch):
+    if args.num_gpus > 1:
+        builder = build_multigpu
+    else:
+        builder = build_singlegpu
+    return builder(args,wavenet_params,audio_batch)
+
+
+def standalone(args,wavenet_params,logdir,logdir_root,restore_from,is_overwritten_training):
+    coord, audio_batch, reader = create_inputs(args,wavenet_params)
+
+    loss, optim, summary_op = get_tower(args,wavenet_params,audio_batch)
 
     # Set up logging for TensorBoard.
     writer = tf.train.SummaryWriter(logdir)
     writer.add_graph(tf.get_default_graph())
     run_metadata = tf.RunMetadata()
-    summaries = tf.merge_summary(summaries)
-    #summaries = tf.merge_all_summaries()
 
     # Set up session
     sess = tf.Session(config=tf.ConfigProto(log_device_placement=False,allow_soft_placement=True))
@@ -312,7 +456,7 @@ def main():
                 run_options = tf.RunOptions(
                     trace_level=tf.RunOptions.FULL_TRACE)
                 summary, loss_value, _ = sess.run(
-                    [summaries, loss, optim],
+                    [summary_op, loss, optim],
                     options=run_options,
                     run_metadata=run_metadata)
                 writer.add_summary(summary, step)
@@ -323,7 +467,7 @@ def main():
                 with open(timeline_path, 'w') as f:
                     f.write(tl.generate_chrome_trace_format(show_memory=True))
             else:
-                summary, loss_value, _ = sess.run([summaries, loss, optim])
+                summary, loss_value, _ = sess.run([summary_op, loss, optim])
                 writer.add_summary(summary, step)
 
             duration = time.time() - start_time
