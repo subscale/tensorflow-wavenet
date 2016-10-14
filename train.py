@@ -183,13 +183,13 @@ def validate_directories(args):
         'restore_from': restore_from
     }
 
-def get_opt(args):
+def create_optimizer(args):
     optimizer = optimizer_factory[args.optimizer](
-                    learning_rate=args.learning_rate,
-                    momentum=args.momentum)    
+        learning_rate=args.learning_rate,
+        momentum=args.momentum)    
     return optimizer
 
-def build_tower(args,wavenet_params,audio_batch):
+def create_network(args,wavenet_params,audio_batch):
     # Create network.
     net = WaveNetModel(
         batch_size=args.batch_size,
@@ -208,22 +208,33 @@ def build_tower(args,wavenet_params,audio_batch):
 
     return loss
 
+def build_singlegpu(args,wavenet_params,audio_batch):
+    loss = create_network(args,wavenet_params,audio_batch)
+    optimizer = create_optimizer(args)
+    trainable = tf.trainable_variables()
+    optim = optimizer.minimize(loss, var_list=trainable)
+    summary_op = tf.merge_all_summaries()
+    return loss, optim, summary_op    
+
 def build_multigpu(args,wavenet_params,audio_batch):
     tower_grads = []
     tower_losses = []
-    optimizer = get_opt(args)
+    optimizer = create_optimizer(args)
+    
     for device_index in xrange(args.num_gpus):
         with tf.device('/gpu:%d' % device_index):
             with tf.name_scope('tower_%d' % device_index) as scope:
-                loss = build_tower(args,wavenet_params,audio_batch)
+                loss = create_network(args,wavenet_params,audio_batch)
                 trainable = tf.trainable_variables()
                 grads = optimizer.compute_gradients(loss, var_list=trainable)
                 tower_losses.append(loss)
                 tower_grads.append(grads)
                 summaries = tf.get_collection(tf.GraphKeys.SUMMARIES, scope)
                 tf.get_variable_scope().reuse_variables()
-
+    
     loss = tf.reduce_mean(tower_losses)
+
+    # average gradients
     average_grads = []
     for grad_and_vars in zip(*tower_grads):
         grads = []
@@ -242,16 +253,13 @@ def build_multigpu(args,wavenet_params,audio_batch):
         v = grad_and_vars[0][1]
         grad_and_var = (grad,v)
         average_grads.append(grad_and_var)
-    optim = optimizer.apply_gradients(average_grads)
-    summary_op = tf.merge_summary(summaries)
-    return loss, optim, summary_op
 
-def build_singlegpu(args,wavenet_params,audio_batch):
-    loss = build_tower(args,wavenet_params,audio_batch)
-    optimizer = get_opt(args)
-    trainable = tf.trainable_variables()
-    optim = optimizer.minimize(loss, var_list=trainable)
-    summary_op = tf.merge_all_summaries()
+    # Pass gradients to optimizer. 
+    optim = optimizer.apply_gradients(average_grads)
+
+    # Summary op
+    summary_op = tf.merge_summary(summaries)
+
     return loss, optim, summary_op
 
 def create_inputs(args,wavenet_params):
@@ -318,9 +326,10 @@ def distributed(args,wavenet_params,logdir):
         with tf.device(tf.train.replica_device_setter(
             worker_device="/job:worker/task:%d" % args.task_index,
             cluster=cluster)):
+
             # Build graph
-            loss = build_tower(args,wavenet_params,audio_batch)
-            optimizer = get_opt(args)
+            loss = create_network(args,wavenet_params,audio_batch)
+            optimizer = create_optimizer(args)
             global_step = tf.Variable(0)
             num_workers = len(worker_hosts)
 
