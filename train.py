@@ -213,11 +213,14 @@ def main():
             sample_size=args.sample_size,
             silence_threshold=args.silence_threshold)
         audio_batch = reader.dequeue(args.batch_size)
+    
+    worker_hosts = args.worker_hosts.split(',')
+    model_parallelism = len(worker_hosts) if args.job_name == 'worker' else 0
 
     # Create network.
     net = WaveNetModel(
         batch_size=args.batch_size,
-        model_parallelism=len(args.worker_hosts) if args.job_name is 'worker' else 0,
+        model_parallelism=model_parallelism,
         dilations=wavenet_params["dilations"],
         filter_width=wavenet_params["filter_width"],
         residual_channels=wavenet_params["residual_channels"],
@@ -233,8 +236,9 @@ def main():
     optimizer = optimizer_factory[args.optimizer](
                     learning_rate=args.learning_rate,
                     momentum=args.momentum)
-    trainable = tf.trainable_variables()
-    global_step = tf.Variable(0, trainable=False)
+    trainable = tf.trainable_variables()    
+    with tf.device('/job:worker/task:0' if model_parallelism > 0 else ''):
+        global_step = tf.Variable(0, trainable=False)
     optim = optimizer.minimize(loss, var_list=trainable, global_step=global_step)
     
     # Set up logging for TensorBoard.
@@ -249,53 +253,54 @@ def main():
     saver = tf.train.Saver(var_list=tf.trainable_variables())
 
     # Set up session
-    if args.job_name == "worker":
-        worker_hosts = args.worker_hosts.split(',')
+    if args.job_name == "worker":        
         cluster = tf.train.ClusterSpec({"worker":worker_hosts})
         server = tf.train.Server(
             cluster,
             job_name=args.job_name,
             task_index=args.task_index
         )
-        init = tf.initialize_all_variables()
         is_chief = (args.task_index == 0)
-        sv = tf.train.Supervisor(
-            is_chief=is_chief,
-            init_op=init,
-            summary_op=summaries,
-            saver=saver,
-            global_step=global_step,
-            logdir=logdir
-        )
-        with sv.managed_session(server.target) as sess:
-            try:
+        if not is_chief:
+            server.join()
+        else:
+            init = tf.initialize_all_variables()
+            
+            sv = tf.train.Supervisor(
+                is_chief=is_chief,
+                init_op=init,
+                summary_op=summaries,
+                saver=saver,
+                global_step=global_step,
+                logdir=logdir
+            )
+            with sv.managed_session(server.target) as sess:
                 threads = tf.train.start_queue_runners(sess=sess, coord=coord)
                 reader.start_threads(sess)
-                total_duration = 0
-                step = 0
+                
+                try:                
+                    total_duration = 0
+                    step = 0
 
-                while not sv.should_stop() and step <= args.num_steps:
-                    start_time = time.time()
+                    while not sv.should_stop() and step <= args.num_steps:
+                        start_time = time.time()
 
-                    sys.stdout.flush()
-                    summary, loss_value, step, _ = sess.run([summaries, loss, global_step, optim])
+                        sys.stdout.flush()
+                        loss_value, step, _ = sess.run([loss, global_step, optim])
 
-                    if is_chief:
-                        writer.add_summary(summary, step)
+                        duration = time.time() - start_time
+                        print('step {:d} - loss = {:.3f}, ({:.3f} sec/step)'
+                            .format(step, loss_value, duration))
 
-                    duration = time.time() - start_time
-                    print('step {:d} - loss = {:.3f}, ({:.3f} sec/step)'
-                        .format(step, loss_value, duration))
+                except KeyboardInterrupt:
+                    # Introduce a line break after ^C is displayed so save message
+                    # is on its own line.
+                    print()
+                finally:
+                    save(saver, sess, logdir, step)
 
-            except KeyboardInterrupt:
-                # Introduce a line break after ^C is displayed so save message
-                # is on its own line.
-                print()
-            finally:
-                save(saver, sess, logdir, step)
-
-                coord.request_stop()
-                coord.join(threads)
+                    coord.request_stop()
+                    coord.join(threads)
 
                 sv.stop()
     else:
