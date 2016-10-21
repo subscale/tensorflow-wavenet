@@ -35,6 +35,7 @@ class WaveNetModel(object):
 
     def __init__(self,
                  batch_size,
+                 model_parallelism,
                  dilations,
                  filter_width,
                  residual_channels,
@@ -49,6 +50,7 @@ class WaveNetModel(object):
         Args:
             batch_size: How many audio files are supplied per batch
                 (recommended: 1).
+            model_parallelism: How many nodes are being used.
             dilations: A list with the dilation factor for each layer.
             filter_width: The samples that are included in each convolution,
                 after dilating.
@@ -70,6 +72,7 @@ class WaveNetModel(object):
                 if scalar_input=True.
         '''
         self.batch_size = batch_size
+        self.model_parallelism = model_parallelism
         self.dilations = dilations
         self.filter_width = filter_width
         self.residual_channels = residual_channels
@@ -81,6 +84,12 @@ class WaveNetModel(object):
         self.initial_filter_width = initial_filter_width
 
         self.variables = self._create_variables()
+
+    def stack_device(self,index):
+        if self.model_parallelism == 0:
+            return '' 
+        where = '/job:worker/task:%d' % (index % self.model_parallelism)
+        return where
 
     def _create_variables(self):
         '''This function creates all variables used by the network.
@@ -108,43 +117,44 @@ class WaveNetModel(object):
             var['dilated_stack'] = list()
             with tf.variable_scope('dilated_stack'):
                 for i, dilation in enumerate(self.dilations):
-                    with tf.variable_scope('layer{}'.format(i)):
-                        current = dict()
-                        current['filter'] = create_variable(
-                            'filter',
-                            [self.filter_width,
-                             self.residual_channels,
-                             self.dilation_channels])
-                        current['gate'] = create_variable(
-                            'gate',
-                            [self.filter_width,
-                             self.residual_channels,
-                             self.dilation_channels])
-                        current['dense'] = create_variable(
-                            'dense',
-                            [1,
-                             self.dilation_channels,
-                             self.residual_channels])
-                        current['skip'] = create_variable(
-                            'skip',
-                            [1,
-                             self.dilation_channels,
-                             self.skip_channels])
-                        if self.use_biases:
-                            current['filter_bias'] = create_bias_variable(
-                                'filter_bias',
-                                [self.dilation_channels])
-                            current['gate_bias'] = create_bias_variable(
-                                'gate_bias',
-                                [self.dilation_channels])
-                            current['dense_bias'] = create_bias_variable(
-                                'dense_bias',
-                                [self.residual_channels])
-                            current['skip_bias'] = create_bias_variable(
-                                'slip_bias',
-                                [self.skip_channels])
+                    with tf.device(self.stack_device(i * self.model_parallelism / len(self.dilations))):
+                        with tf.variable_scope('layer{}'.format(i)):
+                            current = dict()
+                            current['filter'] = create_variable(
+                                'filter',
+                                [self.filter_width,
+                                self.residual_channels,
+                                self.dilation_channels])
+                            current['gate'] = create_variable(
+                                'gate',
+                                [self.filter_width,
+                                self.residual_channels,
+                                self.dilation_channels])
+                            current['dense'] = create_variable(
+                                'dense',
+                                [1,
+                                self.dilation_channels,
+                                self.residual_channels])
+                            current['skip'] = create_variable(
+                                'skip',
+                                [1,
+                                self.dilation_channels,
+                                self.skip_channels])
+                            if self.use_biases:
+                                current['filter_bias'] = create_bias_variable(
+                                    'filter_bias',
+                                    [self.dilation_channels])
+                                current['gate_bias'] = create_bias_variable(
+                                    'gate_bias',
+                                    [self.dilation_channels])
+                                current['dense_bias'] = create_bias_variable(
+                                    'dense_bias',
+                                    [self.residual_channels])
+                                current['skip_bias'] = create_bias_variable(
+                                    'slip_bias',
+                                    [self.skip_channels])
 
-                        var['dilated_stack'].append(current)
+                            var['dilated_stack'].append(current)
 
             with tf.variable_scope('postprocessing'):
                 current = dict()

@@ -32,6 +32,8 @@ L2_REGULARIZATION_STRENGTH = 0
 SILENCE_THRESHOLD = 0.3
 EPSILON = 0.001
 MOMENTUM = 0.9
+WORKER_HOSTS = ''
+JOB_NAME = 'standalone'
 
 
 def get_arguments():
@@ -86,6 +88,12 @@ def get_arguments():
                         default=MOMENTUM, help='Specify the momentum to be '
                         'used by sgd or rmsprop optimizer. Ignored by the '
                         'adam optimizer.')
+    parser.add_argument('--worker_hosts', type=str, default=WORKER_HOSTS,
+                        help='Comma-separated list of hostname:port pairs')
+    parser.add_argument('--job_name', type=str, default=JOB_NAME,
+                        help="One of 'worker', 'standalone'")
+    parser.add_argument('--task_index', type=int, default=0,
+                        help="Index of task within the job")                                        
     return parser.parse_args()
 
 
@@ -209,6 +217,7 @@ def main():
     # Create network.
     net = WaveNetModel(
         batch_size=args.batch_size,
+        model_parallelism=len(args.worker_hosts) if args.job_name is 'worker' else 0,
         dilations=wavenet_params["dilations"],
         filter_width=wavenet_params["filter_width"],
         residual_channels=wavenet_params["residual_channels"],
@@ -225,80 +234,132 @@ def main():
                     learning_rate=args.learning_rate,
                     momentum=args.momentum)
     trainable = tf.trainable_variables()
-    optim = optimizer.minimize(loss, var_list=trainable)
-
+    global_step = tf.Variable(0, trainable=False)
+    optim = optimizer.minimize(loss, var_list=trainable, global_step=global_step)
+    
     # Set up logging for TensorBoard.
     writer = tf.train.SummaryWriter(logdir)
     writer.add_graph(tf.get_default_graph())
     run_metadata = tf.RunMetadata()
     summaries = tf.merge_all_summaries()
 
-    # Set up session
-    sess = tf.Session(config=tf.ConfigProto(log_device_placement=False))
     init = tf.initialize_all_variables()
-    sess.run(init)
 
     # Saver for storing checkpoints of the model.
     saver = tf.train.Saver(var_list=tf.trainable_variables())
 
-    try:
-        saved_global_step = load(saver, sess, restore_from)
-        if is_overwritten_training or saved_global_step is None:
-            # The first training step will be saved_global_step + 1,
-            # therefore we put -1 here for new or overwritten trainings.
-            saved_global_step = -1
+    # Set up session
+    if args.job_name == "worker":
+        worker_hosts = args.worker_hosts.split(',')
+        cluster = tf.train.ClusterSpec({"worker":worker_hosts})
+        server = tf.train.Server(
+            cluster,
+            job_name=args.job_name,
+            task_index=args.task_index
+        )
+        init = tf.initialize_all_variables()
+        is_chief = (args.task_index == 0)
+        sv = tf.train.Supervisor(
+            is_chief=is_chief,
+            init_op=init,
+            summary_op=summaries,
+            saver=saver,
+            global_step=global_step,
+            logdir=logdir
+        )
+        with sv.managed_session(server.target) as sess:
+            try:
+                threads = tf.train.start_queue_runners(sess=sess, coord=coord)
+                reader.start_threads(sess)
+                total_duration = 0
+                step = 0
 
-    except:
-        print("Something went wrong while restoring checkpoint. "
-              "We will terminate training to avoid accidentally overwriting "
-              "the previous model.")
-        raise
+                while not sv.should_stop() and step <= args.num_steps:
+                    start_time = time.time()
 
-    threads = tf.train.start_queue_runners(sess=sess, coord=coord)
-    reader.start_threads(sess)
+                    sys.stdout.flush()
+                    summary, loss_value, step, _ = sess.run([summaries, loss, global_step, optim])
 
-    step = None
-    try:
-        last_saved_step = saved_global_step
-        for step in range(saved_global_step + 1, args.num_steps):
-            start_time = time.time()
-            if args.store_metadata and step % 50 == 0:
-                # Slow run that stores extra information for debugging.
-                print('Storing metadata')
-                run_options = tf.RunOptions(
-                    trace_level=tf.RunOptions.FULL_TRACE)
-                summary, loss_value, _ = sess.run(
-                    [summaries, loss, optim],
-                    options=run_options,
-                    run_metadata=run_metadata)
-                writer.add_summary(summary, step)
-                writer.add_run_metadata(run_metadata,
-                                        'step_{:04d}'.format(step))
-                tl = timeline.Timeline(run_metadata.step_stats)
-                timeline_path = os.path.join(logdir, 'timeline.trace')
-                with open(timeline_path, 'w') as f:
-                    f.write(tl.generate_chrome_trace_format(show_memory=True))
-            else:
-                summary, loss_value, _ = sess.run([summaries, loss, optim])
-                writer.add_summary(summary, step)
+                    if is_chief:
+                        writer.add_summary(summary, step)
 
-            duration = time.time() - start_time
-            print('step {:d} - loss = {:.3f}, ({:.3f} sec/step)'
-                  .format(step, loss_value, duration))
+                    duration = time.time() - start_time
+                    print('step {:d} - loss = {:.3f}, ({:.3f} sec/step)'
+                        .format(step, loss_value, duration))
 
-            if step % args.checkpoint_every == 0:
+            except KeyboardInterrupt:
+                # Introduce a line break after ^C is displayed so save message
+                # is on its own line.
+                print()
+            finally:
                 save(saver, sess, logdir, step)
-                last_saved_step = step
 
-    except KeyboardInterrupt:
-        # Introduce a line break after ^C is displayed so save message
-        # is on its own line.
-        print()
-    finally:
-        if step > last_saved_step:
-            save(saver, sess, logdir, step)
-        coord.request_stop()
-        coord.join(threads)
+                coord.request_stop()
+                coord.join(threads)
+
+                sv.stop()
+    else:
+        sess = tf.Session(config=tf.ConfigProto(log_device_placement=False))        
+        sess.run(init)    
+
+        try:
+            saved_global_step = load(saver, sess, restore_from)
+            if is_overwritten_training or saved_global_step is None:
+                # The first training step will be saved_global_step + 1,
+                # therefore we put -1 here for new or overwritten trainings.
+                saved_global_step = -1
+
+        except:
+            print("Something went wrong while restoring checkpoint. "
+                "We will terminate training to avoid accidentally overwriting "
+                "the previous model.")
+            raise
+
+        threads = tf.train.start_queue_runners(sess=sess, coord=coord)
+        reader.start_threads(sess)
+
+        step = None
+        try:
+            last_saved_step = saved_global_step
+            for step in range(saved_global_step + 1, args.num_steps):
+                start_time = time.time()
+                if args.store_metadata and step % 50 == 0:
+                    # Slow run that stores extra information for debugging.
+                    print('Storing metadata')
+                    run_options = tf.RunOptions(
+                        trace_level=tf.RunOptions.FULL_TRACE)
+                    summary, loss_value, _ = sess.run(
+                        [summaries, loss, optim],
+                        options=run_options,
+                        run_metadata=run_metadata)
+                    writer.add_summary(summary, step)
+                    writer.add_run_metadata(run_metadata,
+                                            'step_{:04d}'.format(step))
+                    tl = timeline.Timeline(run_metadata.step_stats)
+                    timeline_path = os.path.join(logdir, 'timeline.trace')
+                    with open(timeline_path, 'w') as f:
+                        f.write(tl.generate_chrome_trace_format(show_memory=True))
+                else:
+                    summary, loss_value, _ = sess.run([summaries, loss, optim])
+                    writer.add_summary(summary, step)
+
+                duration = time.time() - start_time
+                print('step {:d} - loss = {:.3f}, ({:.3f} sec/step)'
+                    .format(step, loss_value, duration))
+
+                if step % args.checkpoint_every == 0:
+                    save(saver, sess, logdir, step)
+                    last_saved_step = step
+
+        except KeyboardInterrupt:
+            # Introduce a line break after ^C is displayed so save message
+            # is on its own line.
+            print()
+        finally:
+            if step > last_saved_step:
+                save(saver, sess, logdir, step)
+            coord.request_stop()
+            coord.join(threads)
 
 
 if __name__ == '__main__':
