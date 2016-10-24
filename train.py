@@ -274,7 +274,7 @@ def main():
                 global_step=global_step,
                 logdir=logdir
             )
-            with sv.managed_session(server.target,config=tf.ConfigProto(log_device_placement=False)) as sess:
+            with sv.managed_session(server.target,config=tf.ConfigProto(log_device_placement=True)) as sess:
                 threads = tf.train.start_queue_runners(sess=sess, coord=coord)
                 reader.start_threads(sess)
                 
