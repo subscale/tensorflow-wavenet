@@ -305,7 +305,7 @@ class WaveNetModel(object):
         # Add all defined dilation layers.
         with tf.name_scope('dilated_stack'):
             for layer_index, dilation in enumerate(self.dilations):
-                with tf.device(self.stack_device(i * self.model_parallelism / len(self.dilations))):
+                with tf.device(self.stack_device(layer_index * self.model_parallelism / len(self.dilations))):
                     with tf.name_scope('layer{}'.format(layer_index)):
                         output, current_layer = self._create_dilation_layer(
                             current_layer, layer_index, dilation)
