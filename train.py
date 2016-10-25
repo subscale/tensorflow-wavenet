@@ -235,7 +235,8 @@ def main():
     loss = net.loss(audio_batch, args.l2_regularization_strength)
     optimizer = optimizer_factory[args.optimizer](
                     learning_rate=args.learning_rate,
-                    momentum=args.momentum)
+                    momentum=args.momentum,
+                    colocate_gradients_with_ops=True)
     trainable = tf.trainable_variables()    
     with tf.device('/job:worker/task:0' if model_parallelism > 0 else ''):
         global_step = tf.Variable(0, trainable=False)
@@ -274,7 +275,7 @@ def main():
                 global_step=global_step,
                 logdir=logdir
             )
-            with sv.managed_session(server.target,config=tf.ConfigProto(log_device_placement=True)) as sess:
+            with sv.managed_session(server.target,config=tf.ConfigProto(log_device_placement=False,allow_soft_placement=True)) as sess:
                 threads = tf.train.start_queue_runners(sess=sess, coord=coord)
                 reader.start_threads(sess)
                 
