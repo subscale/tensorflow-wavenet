@@ -239,7 +239,7 @@ def main():
     trainable = tf.trainable_variables()    
     with tf.device('/job:worker/task:0' if model_parallelism > 0 else ''):
         global_step = tf.Variable(0, trainable=False)
-    optim = optimizer.minimize(loss, var_list=trainable, global_step=global_step)
+    optim = optimizer.minimize(loss, var_list=trainable, global_step=global_step, colocate_gradients_with_ops=True)
     
     # Set up logging for TensorBoard.
     writer = tf.train.SummaryWriter(logdir)
