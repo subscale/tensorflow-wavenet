@@ -2,6 +2,8 @@ import tensorflow as tf
 
 from .ops import causal_conv, mu_law_encode
 
+def bit_length(x):
+    return x.bit_length()
 
 def create_variable(name, shape):
     '''Create a convolution filter variable with the specified name and shape,
@@ -72,12 +74,16 @@ class WaveNetModel(object):
             histograms: Whether to store histograms in the summary.
                 Default: False.
         '''
+        self.binary_input = True
         self.batch_size = batch_size
         self.dilations = dilations
         self.filter_width = filter_width
         self.residual_channels = residual_channels
         self.dilation_channels = dilation_channels
         self.quantization_channels = quantization_channels
+        self.inout_channels = quantization_channels
+        if self.binary_input:
+            self.inout_channels = bit_length(self.quantization_channels-1) * 2
         self.use_biases = use_biases
         self.skip_channels = skip_channels
         self.scalar_input = scalar_input
@@ -100,7 +106,7 @@ class WaveNetModel(object):
                     initial_channels = 1
                     initial_filter_width = self.initial_filter_width
                 else:
-                    initial_channels = self.quantization_channels
+                    initial_channels = self.inout_channels
                     initial_filter_width = self.filter_width
                 layer['filter'] = create_variable(
                     'filter',
@@ -157,14 +163,14 @@ class WaveNetModel(object):
                     [1, self.skip_channels, self.skip_channels])
                 current['postprocess2'] = create_variable(
                     'postprocess2',
-                    [1, self.skip_channels, self.quantization_channels])
+                    [1, self.skip_channels, self.inout_channels])
                 if self.use_biases:
                     current['postprocess1_bias'] = create_bias_variable(
                         'postprocess1_bias',
                         [self.skip_channels])
                     current['postprocess2_bias'] = create_bias_variable(
                         'postprocess2_bias',
-                        [self.quantization_channels])
+                        [self.inout_channels])
                 var['postprocessing'] = current
 
         return var
@@ -293,7 +299,7 @@ class WaveNetModel(object):
         if self.scalar_input:
             initial_channels = 1
         else:
-            initial_channels = self.quantization_channels
+            initial_channels = self.inout_channels
 
         current_layer = self._create_causal_layer(current_layer)
 
@@ -345,9 +351,9 @@ class WaveNetModel(object):
         q = tf.FIFOQueue(
             1,
             dtypes=tf.float32,
-            shapes=(self.batch_size, self.quantization_channels))
+            shapes=(self.batch_size, self.inout_channels))
         init = q.enqueue_many(
-            tf.zeros((1, self.batch_size, self.quantization_channels)))
+            tf.zeros((1, self.batch_size, self.inout_channels)))
 
         current_state = q.dequeue()
         push = q.enqueue([current_layer])
@@ -454,17 +460,38 @@ class WaveNetModel(object):
             raise NotImplementedError("Incremental generation does not "
                                       "support scalar input yet.")
         with tf.name_scope(name):
-
-            encoded = tf.one_hot(waveform, self.quantization_channels)
-            encoded = tf.reshape(encoded, [-1, self.quantization_channels])
+            if self.binary_input:
+                bits = []
+                y = tf.cast(waveform,tf.float32)
+                for i in reversed(range(self.inout_channels)):
+                    pat = 2 ** i
+                    z = tf.floor(y / pat)
+                    bits.append(z)
+                    y = y - z * pat
+                encoded = tf.concat(2,bits)                
+            else:
+                encoded = tf.one_hot(waveform, self.inout_channels)
+                encoded = tf.reshape(encoded, [-1, self.inout_channels])
             raw_output = self._create_generator(encoded)
-            out = tf.reshape(raw_output, [-1, self.quantization_channels])
-            proba = tf.cast(
-                tf.nn.softmax(tf.cast(out, tf.float64)), tf.float32)
-            last = tf.slice(
-                proba,
-                [tf.shape(proba)[0] - 1, 0],
-                [1, self.quantization_channels])
+            out = tf.reshape(raw_output, [-1, self.inout_channels])
+            if self.binary_input:
+                p = tf.reshape(tf.nn.sigmoid(out), [1,self.inout_channels])
+                last = []
+                q = tf.constant(1.)
+                for i in range(self.quantization_channels):
+                    for j in range(self.inout_channels):
+                        if i & (2 ** j):
+                            q = q * p[j]
+                        else:
+                            q = q * (1.-p[j])
+                    last.append(q)          
+            else:
+                proba = tf.cast(
+                    tf.nn.softmax(tf.cast(out, tf.float64)), tf.float32)
+                last = tf.slice(
+                    proba,
+                    [tf.shape(proba)[0] - 1, 0],
+                    [1, self.quantization_channels])                    
             return tf.reshape(last, [-1])
 
     def loss(self,
@@ -480,7 +507,22 @@ class WaveNetModel(object):
             input_batch = mu_law_encode(input_batch,
                                         self.quantization_channels)
 
-            encoded = self._one_hot(input_batch)
+            if self.binary_input:
+                bits = []
+                y = tf.cast(input_batch,tf.float32)
+                for i in reversed(range(self.inout_channels/2)):
+                    pat = 2 ** i
+                    z = tf.floor(y / pat)
+                    c = tf.one_hot(
+                        tf.cast(z,tf.uint8),
+                        depth=2,
+                        dtype=tf.float32)
+                    c = tf.reshape(c, [self.batch_size, -1, 2])
+                    bits.append(c)
+                    y = y - z * pat
+                encoded = tf.concat(2,bits)
+            else:
+                encoded = self._one_hot(input_batch)
             if self.scalar_input:
                 network_input = tf.reshape(
                     tf.cast(input_batch, tf.float32),
@@ -498,11 +540,25 @@ class WaveNetModel(object):
                 shifted = tf.pad(shifted, [[0, 0], [0, 1], [0, 0]])
 
                 prediction = tf.reshape(raw_output,
-                                        [-1, self.quantization_channels])
-                loss = tf.nn.softmax_cross_entropy_with_logits(
-                    prediction,
-                    tf.reshape(shifted, [-1, self.quantization_channels]))
-                reduced_loss = tf.reduce_mean(loss)
+                                        [-1, self.inout_channels])
+                if self.binary_input:
+                    shifted2 = tf.reshape(shifted, [-1, self.inout_channels])
+                    bits = self.inout_channels/2
+                    P = tf.split(1,bits,prediction)
+                    S = tf.split(1,bits,shifted2)
+                    losses = []
+                    for i in range(bits):
+                        loss = tf.nn.softmax_cross_entropy_with_logits(
+                            P[i],
+                            S[i])
+                        loss = loss * (2 ** (bits-i))
+                        losses.append(loss)
+                    reduced_loss = tf.reduce_mean(losses)
+                else:
+                    loss = tf.nn.softmax_cross_entropy_with_logits(
+                        prediction,
+                        tf.reshape(shifted, [-1, self.inout_channels]))
+                    reduced_loss = tf.reduce_mean(loss)
 
                 tf.scalar_summary('loss', reduced_loss)
 
