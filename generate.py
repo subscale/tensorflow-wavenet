@@ -128,6 +128,7 @@ def main():
         quantization_channels=wavenet_params['quantization_channels'],
         skip_channels=wavenet_params['skip_channels'],
         use_biases=wavenet_params['use_biases'],
+        binary_input=wavenet_params['binary_input'],
         scalar_input=wavenet_params['scalar_input'],
         initial_filter_width=wavenet_params['initial_filter_width'])
 
@@ -195,19 +196,29 @@ def main():
         prediction = sess.run(outputs, feed_dict={samples: window})[0]
 
         # Scale prediction distribution using temperature.
-        np.seterr(divide='ignore')
-        scaled_prediction = np.log(prediction) / args.temperature
-        scaled_prediction = scaled_prediction - np.logaddexp.reduce(scaled_prediction)
-        scaled_prediction = np.exp(scaled_prediction)
-        np.seterr(divide='warn')
+        if wavenet_params['binary_input']:
+            sample = 0
+            pat = 1 << (len(prediction)-1)            
+            for i in range(len(prediction)):
+                if np.argmax(prediction[i]) == 1:
+                    sample = sample | pat
+                pat = pat >> 1
+                
+            waveform.append(sample)
+        else:
+            np.seterr(divide='ignore')
+            scaled_prediction = np.log(prediction) / args.temperature
+            scaled_prediction = scaled_prediction - np.logaddexp.reduce(scaled_prediction)
+            scaled_prediction = np.exp(scaled_prediction)
+            np.seterr(divide='warn')
 
-        # Prediction distribution at temperature=1.0 should be unchanged after scaling.
-        if args.temperature == 1.0:
-            np.testing.assert_allclose(prediction, scaled_prediction, atol=1e-5, err_msg='Prediction scaling at temperature=1.0 is not working as intended.')
+            # Prediction distribution at temperature=1.0 should be unchanged after scaling.
+            if args.temperature == 1.0:
+                np.testing.assert_allclose(prediction, scaled_prediction, atol=1e-5, err_msg='Prediction scaling at temperature=1.0 is not working as intended.')
 
-        sample = np.random.choice(
-            np.arange(quantization_channels), p=scaled_prediction)
-        waveform.append(sample)
+            sample = np.random.choice(
+                np.arange(quantization_channels), p=scaled_prediction)
+            waveform.append(sample)
 
         # Show progress only once per second.
         current_sample_timestamp = datetime.now()

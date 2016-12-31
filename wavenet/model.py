@@ -44,6 +44,7 @@ class WaveNetModel(object):
                  skip_channels,
                  quantization_channels=2**8,
                  use_biases=False,
+                 binary_input=False,
                  scalar_input=False,
                  initial_filter_width=32,
                  histograms=False):
@@ -74,7 +75,7 @@ class WaveNetModel(object):
             histograms: Whether to store histograms in the summary.
                 Default: False.
         '''
-        self.binary_input = True
+        self.binary_input = binary_input
         self.batch_size = batch_size
         self.dilations = dilations
         self.filter_width = filter_width
@@ -463,28 +464,35 @@ class WaveNetModel(object):
             if self.binary_input:
                 bits = []
                 y = tf.cast(waveform,tf.float32)
-                for i in reversed(range(self.inout_channels)):
+                for i in reversed(range(self.inout_channels/2)):
                     pat = 2 ** i
                     z = tf.floor(y / pat)
-                    bits.append(z)
+                    c = tf.one_hot(
+                        tf.cast(z,tf.uint8),
+                        depth=2,
+                        dtype=tf.float32)
+                    c = tf.reshape(c, [1, -1, 2])
+                    bits.append(c)
                     y = y - z * pat
-                encoded = tf.concat(2,bits)                
+                encoded = tf.concat(2,bits)
             else:
                 encoded = tf.one_hot(waveform, self.inout_channels)
-                encoded = tf.reshape(encoded, [-1, self.inout_channels])
+            encoded = tf.reshape(encoded, [-1, self.inout_channels])
             raw_output = self._create_generator(encoded)
             out = tf.reshape(raw_output, [-1, self.inout_channels])
             if self.binary_input:
-                p = tf.reshape(tf.nn.sigmoid(out), [1,self.inout_channels])
-                last = []
-                q = tf.constant(1.)
-                for i in range(self.quantization_channels):
-                    for j in range(self.inout_channels):
-                        if i & (2 ** j):
-                            q = q * p[j]
-                        else:
-                            q = q * (1.-p[j])
-                    last.append(q)          
+                bits = self.inout_channels/2
+                O = tf.split(1,bits,out)
+                L = []
+                for i in range(bits):
+                    proba = tf.cast(
+                        tf.nn.softmax(tf.cast(O[i], tf.float64)), tf.float32)
+                    last = tf.slice(
+                        proba,
+                        [tf.shape(proba)[0] - 1, 0],
+                        [1, 2])                    
+                    L.append(tf.reshape(last,[-1]))
+                return L                              
             else:
                 proba = tf.cast(
                     tf.nn.softmax(tf.cast(out, tf.float64)), tf.float32)
@@ -492,7 +500,7 @@ class WaveNetModel(object):
                     proba,
                     [tf.shape(proba)[0] - 1, 0],
                     [1, self.quantization_channels])                    
-            return tf.reshape(last, [-1])
+                return tf.reshape(last, [-1])
 
     def loss(self,
              input_batch,
