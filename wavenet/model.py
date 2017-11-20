@@ -251,15 +251,15 @@ class WaveNetModel(object):
 
         if self.histograms:
             layer = 'layer{}'.format(layer_index)
-            tf.histogram_summary(layer + '_filter', weights_filter)
-            tf.histogram_summary(layer + '_gate', weights_gate)
-            tf.histogram_summary(layer + '_dense', weights_dense)
-            tf.histogram_summary(layer + '_skip', weights_skip)
+            tf.summary.histogram(layer + '_filter', weights_filter)
+            tf.summary.histogram(layer + '_gate', weights_gate)
+            tf.summary.histogram(layer + '_dense', weights_dense)
+            tf.summary.histogram(layer + '_skip', weights_skip)
             if self.use_biases:
-                tf.histogram_summary(layer + '_biases_filter', filter_bias)
-                tf.histogram_summary(layer + '_biases_gate', gate_bias)
-                tf.histogram_summary(layer + '_biases_dense', dense_bias)
-                tf.histogram_summary(layer + '_biases_skip', skip_bias)
+                tf.summary.histogram(layer + '_biases_filter', filter_bias)
+                tf.summary.histogram(layer + '_biases_gate', gate_bias)
+                tf.summary.histogram(layer + '_biases_dense', dense_bias)
+                tf.summary.histogram(layer + '_biases_skip', skip_bias)
 
         return skip_contribution, input_batch + transformed
 
@@ -339,11 +339,11 @@ class WaveNetModel(object):
                 b2 = self.variables['postprocessing']['postprocess2_bias']
 
             if self.histograms:
-                tf.histogram_summary('postprocess1_weights', w1)
-                tf.histogram_summary('postprocess2_weights', w2)
+                tf.summary.histogram('postprocess1_weights', w1)
+                tf.summary.histogram('postprocess2_weights', w2)
                 if self.use_biases:
-                    tf.histogram_summary('postprocess1_biases', b1)
-                    tf.histogram_summary('postprocess2_biases', b2)
+                    tf.summary.histogram('postprocess1_biases', b1)
+                    tf.summary.histogram('postprocess2_biases', b2)
 
             # We skip connections from the outputs of each layer, adding them
             # all up here.
@@ -523,12 +523,11 @@ class WaveNetModel(object):
 
                 prediction = tf.reshape(raw_output,
                                         [-1, self.quantization_channels])
-                loss = tf.nn.softmax_cross_entropy_with_logits(
-                    prediction,
-                    tf.reshape(shifted, [-1, self.quantization_channels]))
+                loss = tf.nn.softmax_cross_entropy_with_logits(labels = tf.reshape(shifted, [-1, self.quantization_channels]),
+                    logits = prediction)
                 reduced_loss = tf.reduce_mean(loss)
 
-                tf.scalar_summary('loss', reduced_loss)
+                tf.summary.scalar('loss', reduced_loss)
 
                 if l2_regularization_strength is None:
                     return reduced_loss
@@ -542,7 +541,7 @@ class WaveNetModel(object):
                     total_loss = (reduced_loss +
                                   l2_regularization_strength * l2_loss)
 
-                    tf.scalar_summary('l2_loss', l2_loss)
-                    tf.scalar_summary('total_loss', total_loss)
+                    tf.summary.scalar('l2_loss', l2_loss)
+                    tf.summary.scalar('total_loss', total_loss)
 
                     return total_loss

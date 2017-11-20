@@ -19,18 +19,18 @@ from tensorflow.python.client import timeline
 
 from wavenet import WaveNetModel, AudioReader, optimizer_factory
 
-NUM_GPUS = 1
+NUM_GPUS = 8
 BATCH_SIZE = 1
 DATA_DIRECTORY = './VCTK-Corpus'
 LOGDIR_ROOT = './logdir'
-CHECKPOINT_EVERY = 50
-NUM_STEPS = int(1e5)
+CHECKPOINT_EVERY = 2000
+NUM_STEPS = int(2e5)
 LEARNING_RATE = 1e-3
 WAVENET_PARAMS = './wavenet_params.json'
 STARTED_DATESTRING = "{0:%Y-%m-%dT%H-%M-%S}".format(datetime.now())
 SAMPLE_SIZE = 100000
 L2_REGULARIZATION_STRENGTH = 0
-SILENCE_THRESHOLD = 0.3
+SILENCE_THRESHOLD = 0.01
 EPSILON = 0.001
 MOMENTUM = 0.9
 
@@ -244,19 +244,20 @@ def main():
 
     tower_grads = []
     tower_losses = []
-    for device_index in xrange(args.num_gpus):
-        with tf.device('/gpu:%d' % device_index), tf.name_scope('tower_%d' % device_index) as scope:
-            audio_batch = reader.dequeue(args.batch_size)
-            loss, optimizer, trainable = make_net(args,wavenet_params,audio_batch,reuse_variables=True)
-            grads = optimizer.compute_gradients(loss, var_list=trainable)
-            tower_losses.append(loss)
-            tower_grads.append(grads)
-            summaries = tf.get_collection(tf.GraphKeys.SUMMARIES, scope)
-            tf.get_variable_scope().reuse_variables()
+    with tf.variable_scope(tf.get_variable_scope()) as vscope:
+    	for device_index in xrange(args.num_gpus):
+            with tf.device('/gpu:%d' % device_index), tf.name_scope('tower_%d' % device_index) as scope:
+                audio_batch = reader.dequeue(args.batch_size)
+                loss, optimizer, trainable = make_net(args,wavenet_params,audio_batch,reuse_variables=True)
+                grads = optimizer.compute_gradients(loss, var_list=trainable)
+                tower_losses.append(loss)
+                tower_grads.append(grads)
+                summaries = tf.get_collection(tf.GraphKeys.SUMMARIES, scope)
+                tf.get_variable_scope().reuse_variables()
 
-    if args.num_gpus == 1:
-        optim = optimizer.minimize(loss, var_list=trainable)
-    else:
+    if args.num_gpus > 1:
+        #optim = optimizer.minimize(loss, var_list=trainable)
+    #else:
         loss = tf.reduce_mean(tower_losses)
         average_grads = []
         for grad_and_vars in zip(*tower_grads):
@@ -270,7 +271,7 @@ def main():
             if len(grads) == 0:
                 average_grads.append((None,v))
                 continue
-            grad = tf.concat(0,grads)
+            grad = tf.concat(grads, 0)
             grad = tf.reduce_mean(grad,0)
 
             v = grad_and_vars[0][1]
@@ -279,15 +280,15 @@ def main():
         optim = optimizer.apply_gradients(average_grads)
 
     # Set up logging for TensorBoard.
-    writer = tf.train.SummaryWriter(logdir)
+    writer = tf.summary.FileWriter(logdir)
     writer.add_graph(tf.get_default_graph())
     run_metadata = tf.RunMetadata()
-    summaries = tf.merge_summary(summaries)
+    summaries = tf.summary.merge(summaries)
     #summaries = tf.merge_all_summaries()
 
     # Set up session
     sess = tf.Session(config=tf.ConfigProto(log_device_placement=False,allow_soft_placement=True))
-    init = tf.initialize_all_variables()
+    init = tf.global_variables_initializer() #tf.initialize_all_variables()
     sess.run(init)
 
     # Saver for storing checkpoints of the model.
@@ -314,7 +315,7 @@ def main():
         last_saved_step = saved_global_step
         for step in range(saved_global_step + 1, args.num_steps):
             start_time = time.time()
-            if args.store_metadata and step % 50 == 0:
+            if args.store_metadata and step % 100 == 0:
                 # Slow run that stores extra information for debugging.
                 print('Storing metadata')
                 run_options = tf.RunOptions(
@@ -332,7 +333,8 @@ def main():
                     f.write(tl.generate_chrome_trace_format(show_memory=True))
             else:
                 summary, loss_value, _ = sess.run([summaries, loss, optim])
-                writer.add_summary(summary, step)
+                if step % 100 == 0:
+                    writer.add_summary(summary, step)
 
             duration = time.time() - start_time
             print('step {:d} - loss = {:.3f}, ({:.3f} sec/step)'
